@@ -22,22 +22,14 @@ jobs:
           distribution: 'temurin'
           
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        
-      - name: Cache Gradle packages
-        uses: actions/cache@v4
+        uses: reactivecircus/android-build-actions@v2
         with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-          
+          sdk-version: 34
+          ndk-version: 26
+      
       - name: Build debug APK
         run: |
           cd android
-          chmod +x gradlew
           ./gradlew assembleDebug
           
       - name: Upload APK
