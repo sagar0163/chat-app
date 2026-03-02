@@ -1,0 +1,22 @@
+# Release It Configuration
+{
+  "github": {
+    "release": true,
+    "autoGenerate": true,
+    "assets": ["dist/*"]
+  },
+  "npm": {
+    "publish": false
+  },
+  "plugins": {
+    "@release-it/conventional-changelog": {
+      "preset": "angular",
+      "infile": "CHANGELOG.md"
+    }
+  },
+  "version": "1.0.0",
+  "git": {
+    "commitMessage": "chore: release v${version}",
+    "tagName": "v${version}"
+  }
+}
