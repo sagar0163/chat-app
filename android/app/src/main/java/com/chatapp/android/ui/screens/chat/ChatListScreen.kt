@@ -142,7 +142,7 @@ fun ChatListItem(
         }
     }
     
-    HorizontalDivider()
+    Divider()
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

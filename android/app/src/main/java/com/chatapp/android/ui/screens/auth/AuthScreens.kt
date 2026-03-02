@@ -60,7 +60,7 @@ fun LoginScreen(
             label = { Text("Password") },
             modifier = Modifier.fillMaxWidth(),
             visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = Password),
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
             singleLine = true
         )
         
