@@ -21,7 +21,7 @@ jobs:
           distribution: 'temurin'
           
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v2.2.0
+        uses: android-actions/setup-android@v3.2.2
         
       - name: Build
         working-directory: ./android
