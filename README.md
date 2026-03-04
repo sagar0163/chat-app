@@ -192,6 +192,8 @@ cd android
 ## 🐳 Docker
 
 ```bash
+cd backend
+
 # Start backend with Redis
 docker-compose up -d
 
@@ -201,6 +203,31 @@ docker-compose logs -f
 # Stop
 docker-compose down
 ```
+
+## 🚀 Deployment
+
+### Backend (Production)
+
+1. Set environment variables:
+```bash
+export JWT_SECRET=your-secure-secret-key
+export ALLOWED_ORIGINS=https://your-domain.com
+export DATABASE_URL=postgresql://user:pass@localhost:5432/chat
+export REDIS_URL=redis://localhost:6379
+```
+
+2. Run with production server:
+```bash
+uvicorn main:app --host 0.0.0.0 --port 8000 --workers 4
+```
+
+### Android
+
+Build APK and distribute via your preferred method (Firebase App Distribution, etc.)
+
+### iOS
+
+Archive and submit to App Store via Xcode or Fastlane.
 
 ## 📄 License
 
