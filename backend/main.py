@@ -1,27 +1,43 @@
 """
 Chat App Backend - FastAPI with WebSocket Support
 """
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean, Index
 from sqlalchemy.sql import func
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse
 import json
 import asyncio
+import os
 from enum import Enum
 
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi.responses import JSONResponse
+
+# ============== Rate Limiter ==============
+limiter = Limiter(key_func=get_remote_address)
+
 # ============== CONFIG ==============
-DATABASE_URL = "sqlite+aiosqlite:///./chat.db"
-JWT_SECRET = "chat-app-secret-key-change-in-production"
+import os
+
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./chat.db")
+JWT_SECRET = os.getenv("JWT_SECRET", "chat-app-secret-key-change-in-production")
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 30 * 24  # 30 days
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "43200"))
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:8080,http://127.0.0.1:8080").split(",")
 
 # ============== DATABASE ==============
 engine = create_async_engine(DATABASE_URL, echo=False)
@@ -38,7 +54,7 @@ class User(Base):
     hashed_password = Column(String)
     display_name = Column(String, nullable=True)
     avatar_url = Column(String, nullable=True)
-    is_online = Column(Boolean, default=False)
+    is_online = Column(Boolean, default=False, index=True)
     created_at = Column(DateTime, default=func.now())
 
 class Chat(Base):
@@ -51,20 +67,24 @@ class Chat(Base):
 class ChatMember(Base):
     __tablename__ = "chat_members"
     id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(Integer, ForeignKey("chats.id"))
-    user_id = Column(Integer, ForeignKey("users.id"))
+    chat_id = Column(Integer, ForeignKey("chats.id"), index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), index=True)
     role = Column(String, default="member")  # admin, member
     joined_at = Column(DateTime, default=func.now())
 
 class Message(Base):
     __tablename__ = "messages"
     id = Column(Integer, primary_key=True, index=True)
-    chat_id = Column(Integer, ForeignKey("chats.id"))
-    sender_id = Column(Integer, ForeignKey("users.id"))
+    chat_id = Column(Integer, ForeignKey("chats.id"), index=True)
+    sender_id = Column(Integer, ForeignKey("users.id"), index=True)
     content = Column(Text)
     message_type = Column(String, default="text")  # text, image, file
     is_read = Column(Boolean, default=False)
-    created_at = Column(DateTime, default=func.now())
+    created_at = Column(DateTime, default=func.now(), index=True)
+    
+    __table_args__ = (
+        Index('idx_message_chat_created', 'chat_id', 'created_at'),
+    )
 
 async def init_db():
     async with engine.begin() as conn:
@@ -76,6 +96,31 @@ class UserCreate(BaseModel):
     email: str
     password: str
     display_name: Optional[str] = None
+    
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v):
+        if len(v) < 3:
+            raise ValueError('Username must be at least 3 characters')
+        if len(v) > 30:
+            raise ValueError('Username must be at most 30 characters')
+        if not v.replace('_', '').isalnum():
+            raise ValueError('Username can only contain letters, numbers, and underscores')
+        return v.lower()
+    
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, v):
+        if '@' not in v:
+            raise ValueError('Invalid email format')
+        return v.lower()
+    
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v):
+        if len(v) < 6:
+            raise ValueError('Password must be at least 6 characters')
+        return v
 
 class UserResponse(BaseModel):
     id: int
@@ -130,6 +175,13 @@ class Token(BaseModel):
 class LoginRequest(BaseModel):
     username: str
     password: str
+    
+    @field_validator('username')
+    @classmethod
+    def validate_username(cls, v):
+        if len(v) < 1:
+            raise ValueError('Username is required')
+        return v.strip().lower()
 
 # ============== Auth ==============
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -166,13 +218,17 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
         return user
 
 # ============== WebSocket Manager ==============
+import threading
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[int, WebSocket] = {}  # user_id -> websocket
+        self._lock = threading.Lock()
 
     async def connect(self, user_id: int, websocket: WebSocket):
         await websocket.accept()
-        self.active_connections[user_id] = websocket
+        with self._lock:
+            self.active_connections[user_id] = websocket
         # Update user online status
         async with async_session() as session:
             from sqlalchemy import select, update
@@ -180,8 +236,9 @@ class ConnectionManager:
             await session.commit()
 
     def disconnect(self, user_id: int):
-        if user_id in self.active_connections:
-            del self.active_connections[user_id]
+        with self._lock:
+            if user_id in self.active_connections:
+                del self.active_connections[user_id]
         # Update user offline status
         asyncio.create_task(self._set_offline(user_id))
 
@@ -215,13 +272,21 @@ manager = ConnectionManager()
 
 # ============== FastAPI App ==============
 app = FastAPI(title="Chat App API", version="1.0.0")
+app.state.limiter = limiter
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(
+        status_code=429,
+        content={"detail": "Too many requests. Please slow down."}
+    )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
 )
 
 @app.on_event("startup")
@@ -230,7 +295,8 @@ async def startup():
 
 # ============== Auth Routes ==============
 @app.post("/auth/register", response_model=UserResponse)
-async def register(user: UserCreate):
+@limiter.limit("5/minute")
+async def register(request: Request, user: UserCreate):
     async with async_session() as session:
         from sqlalchemy import select
         result = await session.execute(select(User).where(User.username == user.username))
@@ -253,13 +319,14 @@ async def register(user: UserCreate):
         return new_user
 
 @app.post("/auth/login", response_model=Token)
-async def login(request: LoginRequest):
+@limiter.limit("10/minute")
+async def login(request: Request, login_request: LoginRequest):
     async with async_session() as session:
         from sqlalchemy import select
-        result = await session.execute(select(User).where(User.username == request.username))
+        result = await session.execute(select(User).where(User.username == login_request.username))
         user = result.scalar_one_or_none()
         
-        if not user or not verify_password(request.password, user.hashed_password):
+        if not user or not verify_password(login_request.password, user.hashed_password):
             raise HTTPException(status_code=401, detail="Invalid credentials")
         
         access_token = create_access_token(data={"sub": str(user.id)})
