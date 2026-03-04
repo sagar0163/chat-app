@@ -25,6 +25,11 @@ venv/
 ENV/
 env/
 
+# Environment files
+.env
+.env.local
+*.local
+
 # IDE
 .idea/
 .vscode/
@@ -58,3 +63,7 @@ ios/.xcode.env.local
 # Node
 node_modules/
 package-lock.json
+
+# Backend
+chat.db
+*.pyc
