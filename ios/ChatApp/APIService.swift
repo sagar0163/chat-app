@@ -23,7 +23,17 @@ enum APIError: Error, LocalizedError {
 class APIService: ObservableObject {
     static let shared = APIService()
     
-    private let baseURL = "http://10.0.2.2:8000"  // Use localhost for simulator
+    // Configure base URL - change for production
+    // Use http://10.0.2.2:8000 for Android emulator
+    // Use http://localhost:8000 for iOS simulator
+    private var baseURL: String {
+        #if DEBUG
+        return UserDefaults.standard.string(forKey: "base_url") ?? "http://10.0.2.2:8000"
+        #else
+        return "https://your-api-domain.com"
+        #endif
+    }
+    
     private let decoder = JSONDecoder()
     private let encoder = JSONEncoder()
     
