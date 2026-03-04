@@ -270,6 +270,37 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
+# ============== Cache ==============
+import redis.asyncio as redis
+from functools import wraps
+import hashlib
+import json
+
+redis_client = None
+
+async def get_redis():
+    global redis_client
+    if redis_client is None:
+        try:
+            redis_client = redis.from_url(
+                os.getenv("REDIS_URL", "redis://localhost:6379"),
+                encoding="utf-8",
+                decode_responses=True
+            )
+        except Exception as e:
+            print(f"Redis connection failed: {e}")
+            return None
+    return redis_client
+
+async def invalidate_user_cache(user_id: int):
+    """Invalidate all cache for a user"""
+    r = await get_redis()
+    if r:
+        try:
+            await r.delete(f"chats:user:{user_id}")
+        except Exception:
+            pass
+
 # ============== FastAPI App ==============
 app = FastAPI(title="Chat App API", version="1.0.0")
 app.state.limiter = limiter
@@ -427,10 +458,14 @@ async def create_chat(chat: ChatCreate, current_user: User = Depends(get_current
         )
 
 @app.get("/chats/{chat_id}/messages", response_model=List[MessageResponse])
-async def get_messages(chat_id: int, limit: int = 50, before: Optional[int] = None, 
-                      current_user: User = Depends(get_current_user)):
+@limiter.limit("30/minute")
+async def get_messages(request: Request, chat_id: int, limit: int = 50, before: Optional[int] = None, 
+                      after: Optional[int] = None, current_user: User = Depends(get_current_user)):
+    # Cap limit to prevent abuse
+    limit = min(limit, 100)
+    
     async with async_session() as session:
-        from sqlalchemy import select
+        from sqlalchemy import select, func
         
         # Verify user is member
         result = await session.execute(
@@ -442,30 +477,54 @@ async def get_messages(chat_id: int, limit: int = 50, before: Optional[int] = No
         if not result.scalar_one_or_none():
             raise HTTPException(status_code=403, detail="Not a member of this chat")
         
-        # Get messages
-        query = select(Message).where(Message.chat_id == chat_id)
+        # Get messages with optimized query
+        query = (
+            select(Message, User)
+            .join(User, Message.sender_id == User.id)
+            .where(Message.chat_id == chat_id)
+        )
+        
         if before:
+            # Load older messages (pagination backward)
             query = query.where(Message.id < before)
-        query = query.order_by(Message.created_at.desc()).limit(limit)
+        elif after:
+            # Load newer messages (pagination forward)
+            query = query.where(Message.id > after)
+        
+        # Order and limit - for forward pagination, reverse the order
+        if after:
+            query = query.order_by(Message.created_at.asc()).limit(limit)
+        else:
+            query = query.order_by(Message.created_at.desc()).limit(limit)
         
         result = await session.execute(query)
-        messages = result.scalars().all()
+        rows = result.all()
         
-        # Get sender info
+        # Build response
         response = []
-        for msg in messages:
-            sender_result = await session.execute(select(User).where(User.id == msg.sender_id))
-            sender = sender_result.scalar_one_or_none()
+        for msg, sender in rows:
             response.append(MessageResponse(
                 id=msg.id,
                 chat_id=msg.chat_id,
                 sender_id=msg.sender_id,
-                sender=sender,
+                sender=UserResponse(
+                    id=sender.id,
+                    username=sender.username,
+                    email=sender.email,
+                    display_name=sender.display_name,
+                    avatar_url=sender.avatar_url,
+                    is_online=sender.is_online,
+                    created_at=sender.created_at
+                ),
                 content=msg.content,
                 message_type=msg.message_type,
                 is_read=msg.is_read,
                 created_at=msg.created_at
             ))
+        
+        # Reverse if we paginated forward (to maintain chronological order)
+        if after:
+            response = list(reversed(response))
         
         return response
 
@@ -545,6 +604,216 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
     except WebSocketDisconnect:
         manager.disconnect(user_id)
+
+# ============== Additional Endpoints ==============
+
+# Update user profile
+class ProfileUpdate(BaseModel):
+    display_name: Optional[str] = None
+    avatar_url: Optional[str] = None
+
+@app.put("/users/me", response_model=UserResponse)
+async def update_profile(
+    profile: ProfileUpdate, 
+    current_user: User = Depends(get_current_user)
+):
+    async with async_session() as session:
+        from sqlalchemy import update
+        update_data = {}
+        if profile.display_name:
+            update_data["display_name"] = profile.display_name
+        if profile.avatar_url:
+            update_data["avatar_url"] = profile.avatar_url
+        
+        await session.execute(
+            update(User).where(User.id == current_user.id).values(**update_data)
+        )
+        await session.commit()
+        
+        # Fetch updated user
+        from sqlalchemy import select
+        result = await session.execute(select(User).where(User.id == current_user.id))
+        return result.scalar_one()
+
+# Delete message (soft delete)
+@app.delete("/messages/{message_id}")
+async def delete_message(
+    message_id: int, 
+    current_user: User = Depends(get_current_user)
+):
+    async with async_session() as session:
+        from sqlalchemy import select, update
+        
+        # Check if message exists and user is sender
+        result = await session.execute(
+            select(Message).where(
+                Message.id == message_id,
+                Message.sender_id == current_user.id
+            )
+        )
+        message = result.scalar_one_or_none()
+        
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found or not authorized")
+        
+        # Soft delete - clear content
+        await session.execute(
+            update(Message).where(Message.id == message_id).values(content="[deleted]")
+        )
+        await session.commit()
+        
+        # Invalidate cache
+        await invalidate_user_cache(current_user.id)
+        
+        return {"status": "deleted"}
+
+# Leave chat
+@app.post("/chats/{chat_id}/leave")
+async def leave_chat(
+    chat_id: int, 
+    current_user: User = Depends(get_current_user)
+):
+    async with async_session() as session:
+        from sqlalchemy import select, delete
+        
+        # Verify user is member
+        result = await session.execute(
+            select(ChatMember).where(
+                ChatMember.chat_id == chat_id,
+                ChatMember.user_id == current_user.id
+            )
+        )
+        member = result.scalar_one_or_none()
+        
+        if not member:
+            raise HTTPException(status_code=404, detail="Not a member of this chat")
+        
+        # Don't allow leaving if only one member
+        count_result = await session.execute(
+            select(ChatMember).where(ChatMember.chat_id == chat_id)
+        )
+        members_count = len(count_result.scalars().all())
+        
+        if members_count <= 1:
+            # Delete the chat instead
+            await session.execute(delete(Chat).where(Chat.id == chat_id))
+        else:
+            await session.execute(
+                delete(ChatMember).where(
+                    ChatMember.chat_id == chat_id,
+                    ChatMember.user_id == current_user.id
+                )
+            )
+        
+        await session.commit()
+        
+        # Invalidate cache
+        await invalidate_user_cache(current_user.id)
+        
+        return {"status": "left"}
+
+# Get chat by ID
+@app.get("/chats/{chat_id}", response_model=ChatResponse)
+async def get_chat(chat_id: int, current_user: User = Depends(get_current_user)):
+    async with async_session() as session:
+        from sqlalchemy import select
+        
+        # Verify user is member
+        result = await session.execute(
+            select(ChatMember).where(
+                ChatMember.chat_id == chat_id,
+                ChatMember.user_id == current_user.id
+            )
+        )
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=403, detail="Not a member of this chat")
+        
+        # Get chat
+        chat_result = await session.execute(select(Chat).where(Chat.id == chat_id))
+        chat = chat_result.scalar_one_or_none()
+        
+        # Get members
+        members_result = await session.execute(
+            select(User).join(ChatMember).where(ChatMember.chat_id == chat_id)
+        )
+        members = members_result.scalars().all()
+        
+        # Get last message
+        last_msg_result = await session.execute(
+            select(Message)
+            .where(Message.chat_id == chat_id)
+            .order_by(Message.created_at.desc())
+            .limit(1)
+        )
+        last_message = last_msg_result.scalar_one_or_none()
+        
+        return ChatResponse(
+            id=chat.id,
+            name=chat.name,
+            is_group=chat.is_group,
+            members=members,
+            last_message=last_message,
+            created_at=chat.created_at
+        )
+
+# Search messages
+@app.get("/chats/{chat_id}/search")
+async def search_messages(
+    chat_id: int, 
+    q: str, 
+    limit: int = 20,
+    current_user: User = Depends(get_current_user)
+):
+    async with async_session() as session:
+        from sqlalchemy import select
+        
+        # Verify user is member
+        result = await session.execute(
+            select(ChatMember).where(
+                ChatMember.chat_id == chat_id,
+                ChatMember.user_id == current_user.id
+            )
+        )
+        if not result.scalar_one_or_none():
+            raise HTTPException(status_code=403, detail="Not a member of this chat")
+        
+        # Search messages
+        query = (
+            select(Message, User)
+            .join(User, Message.sender_id == User.id)
+            .where(
+                Message.chat_id == chat_id,
+                Message.content.contains(q)
+            )
+            .order_by(Message.created_at.desc())
+            .limit(min(limit, 50))
+        )
+        
+        result = await session.execute(query)
+        rows = result.all()
+        
+        response = []
+        for msg, sender in rows:
+            response.append(MessageResponse(
+                id=msg.id,
+                chat_id=msg.chat_id,
+                sender_id=msg.sender_id,
+                sender=UserResponse(
+                    id=sender.id,
+                    username=sender.username,
+                    email=sender.email,
+                    display_name=sender.display_name,
+                    avatar_url=sender.avatar_url,
+                    is_online=sender.is_online,
+                    created_at=sender.created_at
+                ),
+                content=msg.content,
+                message_type=msg.message_type,
+                is_read=msg.is_read,
+                created_at=msg.created_at
+            ))
+        
+        return response
 
 # ============== Health Check ==============
 @app.get("/health")
