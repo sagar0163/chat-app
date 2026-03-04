@@ -1,5 +1,8 @@
 # Chat App - Real-time Messaging Application
 
+[![Release](https://img.shields.io/badge/release-1.0.0-blue.svg)](https://github.com/sagar0163/chat-app)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
 A full-stack real-time messaging application with WebSocket support, featuring a Python FastAPI backend, Android (Kotlin) app, and iOS (Swift) app.
 
 ## 🏗️ Architecture
