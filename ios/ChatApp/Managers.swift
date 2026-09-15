@@ -48,13 +48,16 @@ class WebSocketManager: ObservableObject {
     func connect() {
         guard let token = authToken else { return }
         
-        let urlString = "ws://10.0.2.2:8000/ws/\(token)"
+        let urlString = "ws://10.0.2.2:8000/ws"
         guard let url = URL(string: urlString) else { return }
+        
+        var request = URLRequest(url: url)
+        request.addValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         
         let configuration = URLSessionConfiguration.default
         let session = URLSession(configuration: configuration)
         
-        webSocketTask = session.webSocketTask(with: url)
+        webSocketTask = session.webSocketTask(with: request)
         webSocketTask?.resume()
         
         isConnected = true
