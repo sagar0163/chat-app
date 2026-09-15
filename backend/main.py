@@ -1,7 +1,7 @@
 """
 Chat App Backend - FastAPI with WebSocket Support
 """
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
@@ -17,9 +17,12 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 import json
 import asyncio
 import os
+import uuid
+import shutil
 from enum import Enum
 
 from slowapi import Limiter
@@ -319,8 +322,11 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 @app.on_event("startup")
 async def startup():
+    os.makedirs("uploads", exist_ok=True)
     await init_db()
 
 # ============== Auth Routes ==============
@@ -605,6 +611,44 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
         manager.disconnect(user_id)
 
 # ============== Additional Endpoints ==============
+
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+ALLOWED_FILE_TYPES = ALLOWED_IMAGE_TYPES + ["application/pdf", "text/plain", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
+
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    content_type = file.content_type
+    
+    # Check type
+    if content_type not in ALLOWED_FILE_TYPES:
+        raise HTTPException(status_code=400, detail="File type not allowed")
+        
+    # Read first to get the size
+    content = await file.read()
+    size = len(content)
+    
+    # Check size based on type
+    is_image = content_type in ALLOWED_IMAGE_TYPES
+    if is_image and size > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=400, detail="Image exceeds maximum allowed size (5MB)")
+    elif not is_image and size > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File exceeds maximum allowed size (10MB)")
+        
+    # Generate unique filename
+    ext = os.path.splitext(file.filename)[1] if file.filename else ""
+    filename = f"{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join("uploads", filename)
+    
+    # Save file
+    with open(filepath, "wb") as f:
+        f.write(content)
+        
+    return {"url": f"/uploads/{filename}", "filename": file.filename, "content_type": content_type, "size": size}
 
 # Update user profile
 class ProfileUpdate(BaseModel):
