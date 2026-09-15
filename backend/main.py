@@ -86,6 +86,15 @@ class Message(Base):
         Index('idx_message_chat_created', 'chat_id', 'created_at'),
     )
 
+class ChatInvite(Base):
+    __tablename__ = "chat_invites"
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey("chats.id"), index=True)
+    inviter_id = Column(Integer, ForeignKey("users.id"), index=True)
+    invitee_id = Column(Integer, ForeignKey("users.id"), index=True)
+    status = Column(String, default="pending")  # pending, accepted, rejected
+    created_at = Column(DateTime, default=func.now())
+
 async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -164,6 +173,17 @@ class MessageResponse(BaseModel):
     is_read: bool
     created_at: datetime
 
+    class Config:
+        from_attributes = True
+
+class ChatInviteResponse(BaseModel):
+    id: int
+    chat_id: int
+    inviter_id: int
+    invitee_id: int
+    status: str
+    created_at: datetime
+    
     class Config:
         from_attributes = True
 
@@ -455,15 +475,37 @@ async def create_chat(chat: ChatCreate, current_user: User = Depends(get_current
         await session.refresh(new_chat)
         
         # Add members
-        member_ids = chat.member_ids + [current_user.id]
-        for user_id in member_ids:
-            member = ChatMember(chat_id=new_chat.id, user_id=user_id)
-            session.add(member)
+        # Add the creator as an active member
+        role = "admin" if chat.is_group else "member"
+        creator_member = ChatMember(chat_id=new_chat.id, user_id=current_user.id, role=role)
+        session.add(creator_member)
+        
+        active_member_ids = [current_user.id]
+        all_user_ids = list(set(chat.member_ids + [current_user.id]))
+        
+        for user_id in chat.member_ids:
+            if user_id == current_user.id:
+                continue
+                
+            if chat.is_group:
+                # Group chats require an invite
+                invite = ChatInvite(
+                    chat_id=new_chat.id,
+                    inviter_id=current_user.id,
+                    invitee_id=user_id,
+                    status="pending"
+                )
+                session.add(invite)
+            else:
+                # Direct messages can add the other person directly
+                member = ChatMember(chat_id=new_chat.id, user_id=user_id)
+                session.add(member)
+                active_member_ids.append(user_id)
         
         # If group with no name, auto-generate
         if chat.is_group and not chat.name:
             users_result = await session.execute(
-                select(User).where(User.id.in_(member_ids))
+                select(User).where(User.id.in_(all_user_ids))
             )
             users = users_result.scalars().all()
             names = [u.display_name or u.username for u in users[:3]]
@@ -473,7 +515,7 @@ async def create_chat(chat: ChatCreate, current_user: User = Depends(get_current
         
         # Get members for response
         members_result = await session.execute(
-            select(User).where(User.id.in_(member_ids))
+            select(User).where(User.id.in_(active_member_ids))
         )
         members = members_result.scalars().all()
         
@@ -842,6 +884,68 @@ async def search_messages(
             ))
         
         return response
+
+# ============== Invites ==============
+@app.get("/invites", response_model=List[ChatInviteResponse])
+async def get_invites(current_user: User = Depends(get_current_user)):
+    async with async_session() as session:
+        from sqlalchemy import select
+        
+        result = await session.execute(
+            select(ChatInvite).where(
+                ChatInvite.invitee_id == current_user.id,
+                ChatInvite.status == "pending"
+            )
+        )
+        invites = result.scalars().all()
+        return invites
+
+@app.post("/invites/{invite_id}/accept")
+async def accept_invite(invite_id: int, current_user: User = Depends(get_current_user)):
+    async with async_session() as session:
+        from sqlalchemy import select
+        
+        result = await session.execute(
+            select(ChatInvite).where(
+                ChatInvite.id == invite_id,
+                ChatInvite.invitee_id == current_user.id,
+                ChatInvite.status == "pending"
+            )
+        )
+        invite = result.scalar_one_or_none()
+        
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found or already processed")
+            
+        invite.status = "accepted"
+        
+        # Add to chat members
+        member = ChatMember(chat_id=invite.chat_id, user_id=current_user.id, role="member")
+        session.add(member)
+        
+        await session.commit()
+        return {"status": "accepted"}
+
+@app.post("/invites/{invite_id}/reject")
+async def reject_invite(invite_id: int, current_user: User = Depends(get_current_user)):
+    async with async_session() as session:
+        from sqlalchemy import select
+        
+        result = await session.execute(
+            select(ChatInvite).where(
+                ChatInvite.id == invite_id,
+                ChatInvite.invitee_id == current_user.id,
+                ChatInvite.status == "pending"
+            )
+        )
+        invite = result.scalar_one_or_none()
+        
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found or already processed")
+            
+        invite.status = "rejected"
+        await session.commit()
+        return {"status": "rejected"}
 
 # ============== Health Check ==============
 @app.get("/health")
