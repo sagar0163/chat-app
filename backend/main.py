@@ -57,6 +57,14 @@ class User(Base):
     is_online = Column(Boolean, default=False, index=True)
     created_at = Column(DateTime, default=func.now())
 
+class DeviceToken(Base):
+    __tablename__ = "device_tokens"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    token = Column(String, unique=True, index=True)
+    platform = Column(String, default="fcm") # fcm or apns
+    created_at = Column(DateTime, default=func.now())
+
 class Chat(Base):
     __tablename__ = "chats"
     id = Column(Integer, primary_key=True, index=True)
