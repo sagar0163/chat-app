@@ -293,7 +293,7 @@ class ConnectionManager:
         if user_id in self.active_connections:
             await self.active_connections[user_id].send_json(message)
 
-    async def broadcast(self, message: dict, chat_id: int):
+    async def broadcast(self, message: dict, chat_id: int) -> List[int]:
         # Send to all members of the chat
         async with async_session() as session:
             from sqlalchemy import select
@@ -302,9 +302,14 @@ class ConnectionManager:
             )
             member_ids = result.scalars().all()
         
+        offline_users = []
         for user_id in member_ids:
             if user_id in self.active_connections:
                 await self.active_connections[user_id].send_json(message)
+            else:
+                offline_users.append(user_id)
+                
+        return offline_users
 
 manager = ConnectionManager()
 
@@ -612,7 +617,22 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
                     }
                     
                     # Broadcast to chat members
-                    await manager.broadcast(response, new_message.chat_id)
+                    offline_users = await manager.broadcast(response, new_message.chat_id)
+                    
+                    # Exclude the sender from push notifications
+                    if user_id in offline_users:
+                        offline_users.remove(user_id)
+                        
+                    if offline_users:
+                        import asyncio
+                        sender_name = sender.display_name if sender else "Unknown"
+                        asyncio.create_task(
+                            trigger_push_notifications(
+                                offline_users, 
+                                response, 
+                                sender_name
+                            )
+                        )
             
             elif message_data.get("type") == "typing":
                 # Broadcast typing indicator
