@@ -378,7 +378,8 @@ async def get_users(current_user: User = Depends(get_current_user)):
 @app.get("/chats", response_model=List[ChatResponse])
 async def get_chats(current_user: User = Depends(get_current_user)):
     async with async_session() as session:
-        from sqlalchemy import select
+        from sqlalchemy import select, func
+        
         result = await session.execute(
             select(Chat)
             .join(ChatMember)
@@ -387,29 +388,57 @@ async def get_chats(current_user: User = Depends(get_current_user)):
         )
         chats = result.scalars().all()
         
+        if not chats:
+            return []
+            
+        chat_ids = [chat.id for chat in chats]
+        
+        # Get all members for these chats in one query
+        members_result = await session.execute(
+            select(ChatMember.chat_id, User)
+            .join(User, ChatMember.user_id == User.id)
+            .where(ChatMember.chat_id.in_(chat_ids))
+        )
+        members_by_chat = {cid: [] for cid in chat_ids}
+        for chat_id, user in members_result:
+            members_by_chat[chat_id].append(user)
+            
+        # Get last message for these chats using a subquery
+        subq = (
+            select(
+                Message.chat_id,
+                func.max(Message.created_at).label('max_created_at')
+            )
+            .where(Message.chat_id.in_(chat_ids))
+            .group_by(Message.chat_id)
+            .subquery()
+        )
+        
+        last_msgs_result = await session.execute(
+            select(Message)
+            .join(
+                subq,
+                (Message.chat_id == subq.c.chat_id) &
+                (Message.created_at == subq.c.max_created_at)
+            )
+        )
+        
+        last_msg_by_chat = {}
+        for msg in last_msgs_result.scalars():
+            # In case of exact timestamp ties, keep the one with larger ID
+            if msg.chat_id not in last_msg_by_chat or \
+               msg.created_at > last_msg_by_chat[msg.chat_id].created_at or \
+               (msg.created_at == last_msg_by_chat[msg.chat_id].created_at and msg.id > last_msg_by_chat[msg.chat_id].id):
+                last_msg_by_chat[msg.chat_id] = msg
+        
         response = []
         for chat in chats:
-            # Get members
-            members_result = await session.execute(
-                select(User).join(ChatMember).where(ChatMember.chat_id == chat.id)
-            )
-            members = members_result.scalars().all()
-            
-            # Get last message
-            last_msg_result = await session.execute(
-                select(Message)
-                .where(Message.chat_id == chat.id)
-                .order_by(Message.created_at.desc())
-                .limit(1)
-            )
-            last_message = last_msg_result.scalar_one_or_none()
-            
             response.append(ChatResponse(
                 id=chat.id,
                 name=chat.name,
                 is_group=chat.is_group,
-                members=members,
-                last_message=last_message,
+                members=members_by_chat.get(chat.id, []),
+                last_message=last_msg_by_chat.get(chat.id),
                 created_at=chat.created_at
             ))
         return response
