@@ -227,6 +227,37 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
 # ============== WebSocket Manager ==============
 import threading
 
+async def trigger_push_notifications(user_ids: List[int], message_data: dict, sender_name: str):
+    """
+    Mock implementation of FCM/APNs push notification trigger.
+    In a real application, this would use a library like firebase-admin or httpx
+    to send the actual push notification to the respective platform.
+    """
+    if not user_ids:
+        return
+        
+    async with async_session() as session:
+        from sqlalchemy import select
+        result = await session.execute(
+            select(DeviceToken).where(DeviceToken.user_id.in_(user_ids))
+        )
+        tokens = result.scalars().all()
+        
+        for dt in tokens:
+            content = message_data.get("content", "")
+            # Truncate content for push notification
+            if len(content) > 100:
+                content = content[:97] + "..."
+                
+            print(f"PUSH NOTIFICATION [{dt.platform.upper()}]: To User {dt.user_id} (Token: {dt.token}) - {sender_name}: {content}")
+            # Mock HTTP call for APNs/FCM
+            # if dt.platform == 'fcm':
+            #     # HTTP call to FCM endpoint
+            #     pass
+            # elif dt.platform == 'apns':
+            #     # HTTP call to APNs endpoint
+            #     pass
+
 class ConnectionManager:
     def __init__(self):
         self.active_connections: Dict[int, WebSocket] = {}  # user_id -> websocket
