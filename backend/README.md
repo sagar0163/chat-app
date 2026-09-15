@@ -42,7 +42,7 @@ Create a `.env` file based on `.env.example`:
 
 | Endpoint | Description |
 |----------|-------------|
-| `/ws/{token}` | WebSocket connection for real-time messaging |
+| `/ws` | WebSocket connection for real-time messaging |
 
 ### WebSocket Message Types
 

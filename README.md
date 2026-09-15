@@ -187,7 +187,7 @@ cd android
 | GET | `/chats` | List user's chats |
 | POST | `/chats` | Create new chat |
 | GET | `/chats/{id}/messages` | Get chat messages |
-| WS | `/ws/{token}` | WebSocket connection |
+| WS | `/ws` | WebSocket connection |
 
 ## 🐳 Docker
 
