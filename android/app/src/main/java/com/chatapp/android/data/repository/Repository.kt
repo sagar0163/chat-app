@@ -149,7 +149,8 @@ class WebSocketRepository @Inject constructor(
         val token = authRepository.getToken() ?: return
         
         val request = Request.Builder()
-            .url("ws://10.0.2.2:8000/ws/$token")
+            .url("ws://10.0.2.2:8000/ws")
+            .addHeader("Authorization", "Bearer $token")
             .build()
         
         webSocket = client.newWebSocket(request, object : WebSocketListener() {
