@@ -614,6 +614,40 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
 # ============== Additional Endpoints ==============
 
+# Device token registration
+class DeviceTokenCreate(BaseModel):
+    token: str
+    platform: str = "fcm"
+
+@app.post("/users/device-token")
+async def register_device_token(
+    data: DeviceTokenCreate,
+    current_user: User = Depends(get_current_user)
+):
+    async with async_session() as session:
+        from sqlalchemy import select, update
+        
+        # Check if token already exists
+        result = await session.execute(
+            select(DeviceToken).where(DeviceToken.token == data.token)
+        )
+        existing = result.scalar_one_or_none()
+        
+        if existing:
+            if existing.user_id != current_user.id:
+                existing.user_id = current_user.id
+                await session.commit()
+            return {"status": "updated"}
+        
+        new_token = DeviceToken(
+            user_id=current_user.id,
+            token=data.token,
+            platform=data.platform
+        )
+        session.add(new_token)
+        await session.commit()
+        return {"status": "registered"}
+
 # Update user profile
 class ProfileUpdate(BaseModel):
     display_name: Optional[str] = None
