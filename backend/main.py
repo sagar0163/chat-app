@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean, Index
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean, Index, UniqueConstraint
 from sqlalchemy.sql import func
 from pydantic import BaseModel, field_validator
 from typing import Optional, List, Dict
@@ -94,6 +94,10 @@ class ChatInvite(Base):
     invitee_id = Column(Integer, ForeignKey("users.id"), index=True)
     status = Column(String, default="pending")  # pending, accepted, rejected
     created_at = Column(DateTime, default=func.now())
+    
+    __table_args__ = (
+        UniqueConstraint('chat_id', 'invitee_id', name='uq_chat_invite_chat_invitee'),
+    )
 
 async def init_db():
     async with engine.begin() as conn:
@@ -468,27 +472,40 @@ async def create_chat(chat: ChatCreate, current_user: User = Depends(get_current
     async with async_session() as session:
         from sqlalchemy import select
         
+        # Dedupe member_ids while preserving order, and never invite the creator
+        member_ids = list(dict.fromkeys(chat.member_ids))
+        member_ids = [uid for uid in member_ids if uid != current_user.id]
+        
+        # Validate that every member references an existing user
+        if member_ids:
+            users_result = await session.execute(
+                select(User).where(User.id.in_(member_ids))
+            )
+            existing_ids = {u.id for u in users_result.scalars().all()}
+            missing_ids = [uid for uid in member_ids if uid not in existing_ids]
+            if missing_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown user(s): {missing_ids}"
+                )
+        
         # Create chat
         new_chat = Chat(name=chat.name, is_group=chat.is_group)
         session.add(new_chat)
         await session.commit()
         await session.refresh(new_chat)
         
-        # Add members
         # Add the creator as an active member
         role = "admin" if chat.is_group else "member"
         creator_member = ChatMember(chat_id=new_chat.id, user_id=current_user.id, role=role)
         session.add(creator_member)
         
         active_member_ids = [current_user.id]
-        all_user_ids = list(set(chat.member_ids + [current_user.id]))
+        all_user_ids = member_ids + [current_user.id]
         
-        for user_id in chat.member_ids:
-            if user_id == current_user.id:
-                continue
-                
+        for user_id in member_ids:
             if chat.is_group:
-                # Group chats require an invite
+                # Group chats require an invite before membership
                 invite = ChatInvite(
                     chat_id=new_chat.id,
                     inviter_id=current_user.id,
@@ -497,13 +514,13 @@ async def create_chat(chat: ChatCreate, current_user: User = Depends(get_current
                 )
                 session.add(invite)
             else:
-                # Direct messages can add the other person directly
+                # Direct messages add the other person directly
                 member = ChatMember(chat_id=new_chat.id, user_id=user_id)
                 session.add(member)
                 active_member_ids.append(user_id)
         
         # If group with no name, auto-generate
-        if chat.is_group and not chat.name:
+        if chat.is_group and not chat.name and all_user_ids:
             users_result = await session.execute(
                 select(User).where(User.id.in_(all_user_ids))
             )
@@ -916,6 +933,25 @@ async def accept_invite(invite_id: int, current_user: User = Depends(get_current
         
         if not invite:
             raise HTTPException(status_code=404, detail="Invite not found or already processed")
+        
+        # Verify the chat still exists
+        chat_result = await session.execute(
+            select(Chat).where(Chat.id == invite.chat_id)
+        )
+        if not chat_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Chat no longer exists")
+        
+        # Avoid duplicate membership (e.g. accepted via another invite)
+        existing_member = await session.execute(
+            select(ChatMember).where(
+                ChatMember.chat_id == invite.chat_id,
+                ChatMember.user_id == current_user.id
+            )
+        )
+        if existing_member.scalar_one_or_none():
+            invite.status = "accepted"
+            await session.commit()
+            return {"status": "accepted"}
             
         invite.status = "accepted"
         
