@@ -67,3 +67,6 @@ package-lock.json
 # Backend
 chat.db
 *.pyc
+
+# Uploaded files
+uploads/

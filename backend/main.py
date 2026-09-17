@@ -322,11 +322,13 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
-app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 @app.on_event("startup")
 async def startup():
-    os.makedirs("uploads", exist_ok=True)
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     await init_db()
 
 # ============== Auth Routes ==============
@@ -614,41 +616,78 @@ async def websocket_endpoint(websocket: WebSocket, token: str):
 
 MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# Map of allowed content types to a safe file extension. The client-supplied
+# filename/extension is never used for the stored path to avoid path traversal
+# and stored-XSS (e.g. an .html file served from /uploads).
+CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+}
 ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"]
-ALLOWED_FILE_TYPES = ALLOWED_IMAGE_TYPES + ["application/pdf", "text/plain", "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"]
+ALLOWED_FILE_TYPES = list(CONTENT_TYPE_EXTENSIONS.keys())
+
+CHUNK_SIZE = 1024 * 1024  # 1MB read chunks
 
 @app.post("/upload")
 async def upload_file(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user)
 ):
-    content_type = file.content_type
-    
-    # Check type
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+
+    # Validate declared type up-front
     if content_type not in ALLOWED_FILE_TYPES:
         raise HTTPException(status_code=400, detail="File type not allowed")
-        
-    # Read first to get the size
-    content = await file.read()
-    size = len(content)
-    
-    # Check size based on type
+
     is_image = content_type in ALLOWED_IMAGE_TYPES
-    if is_image and size > MAX_IMAGE_SIZE:
-        raise HTTPException(status_code=400, detail="Image exceeds maximum allowed size (5MB)")
-    elif not is_image and size > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="File exceeds maximum allowed size (10MB)")
-        
-    # Generate unique filename
-    ext = os.path.splitext(file.filename)[1] if file.filename else ""
+    max_size = MAX_IMAGE_SIZE if is_image else MAX_FILE_SIZE
+
+    # Stream to disk in chunks, aborting if the limit is exceeded so a huge
+    # upload cannot exhaust memory or disk.
+    ext = CONTENT_TYPE_EXTENSIONS[content_type]
     filename = f"{uuid.uuid4().hex}{ext}"
-    filepath = os.path.join("uploads", filename)
-    
-    # Save file
-    with open(filepath, "wb") as f:
-        f.write(content)
-        
-    return {"url": f"/uploads/{filename}", "filename": file.filename, "content_type": content_type, "size": size}
+    filepath = os.path.join(UPLOAD_DIR, filename)
+
+    size = 0
+    try:
+        with open(filepath, "wb") as f:
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_size:
+                    f.close()
+                    os.remove(filepath)
+                    limit_mb = max_size // (1024 * 1024)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File exceeds maximum allowed size ({limit_mb}MB)",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        raise
+    except Exception:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        raise HTTPException(status_code=500, detail="Failed to store uploaded file")
+    finally:
+        await file.close()
+
+    return {
+        "url": f"/uploads/{filename}",
+        "filename": file.filename,
+        "content_type": content_type,
+        "message_type": "image" if is_image else "file",
+        "size": size,
+    }
 
 # Update user profile
 class ProfileUpdate(BaseModel):
