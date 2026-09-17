@@ -22,19 +22,11 @@ import json
 import asyncio
 import os
 import uuid
-import shutil
-from enum import Enum
-
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from fastapi.responses import JSONResponse
 
 # ============== Rate Limiter ==============
 limiter = Limiter(key_func=get_remote_address)
 
 # ============== CONFIG ==============
-import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./chat.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "chat-app-secret-key-change-in-production")
