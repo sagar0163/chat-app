@@ -1066,6 +1066,8 @@ async def accept_invite(invite_id: int, current_user: User = Depends(get_current
         session.add(member)
         
         await session.commit()
+        # Membership changed, invalidate cached member IDs
+        await invalidate_chat_members_cache(invite.chat_id)
         return {"status": "accepted"}
 
 @app.post("/invites/{invite_id}/reject")

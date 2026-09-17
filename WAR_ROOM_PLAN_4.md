@@ -7,13 +7,14 @@ onto current `main` is required so the PR does not delete those features.
 
 ## Subtasks
 
-- [ ] Rebase `war-room-issue-4` onto current `main`
-- [ ] Re-apply cache changes to `backend/main.py`:
+- [x] Rebase `war-room-issue-4` onto current `main`
+- [x] Re-apply cache changes to `backend/main.py`:
       `get_chat_member_ids()` (Redis-first, DB fallback + populate)
       `invalidate_chat_members_cache()`
       `broadcast()` uses `get_chat_member_ids()`
       invalidate member cache in `leave_chat`
-- [ ] Add unit tests for member-ID cache (hit/miss, invalidate on leave)
-- [ ] Run `pytest` in backend/ and confirm suite passes
+- [x] Invalidate member cache in `accept_invite` (join path)
+- [x] Add unit tests for member-ID cache (hit/miss, invalidate on leave)
+- [x] Run `pytest` in backend/ and confirm suite passes (22 passed)
 - [ ] Final review of `git diff main..war-room-issue-4` (cache changes only)
 - [ ] Delete WAR_ROOM_PLAN_4.md, final commit referencing #4, push branch
