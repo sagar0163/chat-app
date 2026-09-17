@@ -91,6 +91,15 @@ Create a `.env` file based on `.env.example`:
 - `GET /chats/{chat_id}/messages` - Get messages (supports pagination)
 - `GET /chats/{chat_id}/search` - Search messages
 
+### Files
+- `POST /upload` - Upload an image or file (authenticated, multipart/form-data).
+  Returns `{ "url", "filename", "content_type", "message_type", "size" }`.
+  Use the returned `url` as the `content` of a message and the `message_type`
+  (`image` or `file`) when sending it.
+  - Images (`image/jpeg`, `image/png`, `image/gif`, `image/webp`): max 5MB
+  - Files (`application/pdf`, `text/plain`, `application/msword`, `.docx`): max 10MB
+- `GET /uploads/{filename}` - Serve a previously uploaded file (static)
+
 ### Messages
 - `DELETE /messages/{message_id}` - Delete message (own messages only)
 
