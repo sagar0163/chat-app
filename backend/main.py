@@ -275,12 +275,7 @@ class ConnectionManager:
 
     async def broadcast(self, message: dict, chat_id: int):
         # Send to all members of the chat
-        async with async_session() as session:
-            from sqlalchemy import select
-            result = await session.execute(
-                select(ChatMember.user_id).where(ChatMember.chat_id == chat_id)
-            )
-            member_ids = result.scalars().all()
+        member_ids = await get_chat_member_ids(chat_id)
         
         for user_id in member_ids:
             if user_id in self.active_connections:
@@ -316,6 +311,41 @@ async def invalidate_user_cache(user_id: int):
     if r:
         try:
             await r.delete(f"chats:user:{user_id}")
+        except Exception:
+            pass
+
+async def get_chat_member_ids(chat_id: int) -> list[int]:
+    """Get chat members from cache or DB."""
+    r = await get_redis()
+    cache_key = f"chat:members:{chat_id}"
+    if r:
+        try:
+            cached = await r.get(cache_key)
+            if cached:
+                return json.loads(cached)
+        except Exception:
+            pass
+
+    async with async_session() as session:
+        from sqlalchemy import select
+        result = await session.execute(
+            select(ChatMember.user_id).where(ChatMember.chat_id == chat_id)
+        )
+        member_ids = list(result.scalars().all())
+    
+    if r:
+        try:
+            await r.setex(cache_key, 3600, json.dumps(member_ids))
+        except Exception:
+            pass
+    return member_ids
+
+async def invalidate_chat_members_cache(chat_id: int):
+    """Invalidate chat members cache."""
+    r = await get_redis()
+    if r:
+        try:
+            await r.delete(f"chat:members:{chat_id}")
         except Exception:
             pass
 
@@ -877,6 +907,7 @@ async def leave_chat(
         
         # Invalidate cache
         await invalidate_user_cache(current_user.id)
+        await invalidate_chat_members_cache(chat_id)
         
         return {"status": "left"}
 
@@ -1041,6 +1072,8 @@ async def accept_invite(invite_id: int, current_user: User = Depends(get_current
         session.add(member)
         
         await session.commit()
+        # Membership changed, invalidate cached member IDs
+        await invalidate_chat_members_cache(invite.chat_id)
         return {"status": "accepted"}
 
 @app.post("/invites/{invite_id}/reject")
