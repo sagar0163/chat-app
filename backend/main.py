@@ -900,8 +900,14 @@ async def register_device_token(
         existing = result.scalar_one_or_none()
         
         if existing:
+            dirty = False
             if existing.user_id != current_user.id:
                 existing.user_id = current_user.id
+                dirty = True
+            if existing.platform != data.platform:
+                existing.platform = data.platform
+                dirty = True
+            if dirty:
                 await session.commit()
             return {"status": "updated"}
         

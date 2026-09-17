@@ -8,12 +8,12 @@
 - [x] WebSocket handler triggers push for offline users
 
 ## Remaining Work
-- [ ] Restore requirements-dev.txt for pytest
-- [ ] Implement real FCM HTTP v1 API calls using httpx (with service account auth via google-auth)
-- [ ] Implement real APNs HTTP/2 calls using httpx (with JWT token generation from EC key)
-- [ ] Add device token deletion endpoint (`DELETE /users/device-token`)
-- [ ] Update README with new push notification endpoints
-- [ ] Add tests for device token registration endpoint
-- [ ] Add tests for push notification dispatch logic (mock httpx calls)
-- [ ] Add conftest.py with test fixtures
-- [ ] Run tests and fix failures
+- [x] Restore requirements-dev.txt for pytest
+- [x] Implement real FCM HTTP v1 API calls using httpx (with service account auth via google-auth/jose RS256)
+- [x] Implement real APNs HTTP/2 calls using httpx (with JWT token generation from EC key)
+- [x] Add device token deletion endpoint (`DELETE /users/device-token`)
+- [x] Update README with new push notification endpoints
+- [x] Add conftest.py with test fixtures
+- [x] Add tests for device token registration endpoint
+- [x] Add tests for push notification dispatch logic (mock httpx calls)
+- [x] Run tests and fix failures
