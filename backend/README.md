@@ -32,6 +32,13 @@ Create a `.env` file based on `.env.example`:
 | `ACCESS_TOKEN_EXPIRE_MINUTES` | `43200` | Token expiry time (30 days) |
 | `ALLOWED_ORIGINS` | `http://localhost:8080` | CORS allowed origins (comma-separated) |
 | `REDIS_URL` | `redis://localhost:6379` | Redis connection for caching |
+| `FCM_PROJECT_ID` | | Firebase project ID for FCM (HTTP v1) |
+| `FCM_SERVICE_ACCOUNT_FILE` | | Path to Firebase service account JSON |
+| `FCM_SERVICE_ACCOUNT_JSON` | | Firebase service account JSON (inline) |
+| `APNS_TEAM_ID` | | Apple Developer team ID for APNs |
+| `APNS_KEY_ID` | | APNs auth key ID |
+| `APNS_BUNDLE_ID` | | App bundle identifier (push topic) |
+| `APNS_AUTH_KEY_FILE` | | Path to APNs `.p8` auth key |
 
 ### API Documentation
 
@@ -82,6 +89,21 @@ Create a `.env` file based on `.env.example`:
 
 ### Users
 - `GET /users` - List all users (excluding current user)
+- `POST /users/device-token` - Register a device push token (`token`, `platform`: `fcm`/`apns`)
+- `DELETE /users/device-token` - Unregister a device push token (`token` query param)
+- `GET /users/device-tokens` - List the current user's registered device tokens
+
+### Push Notifications
+
+When a message is received, offline chat members are sent a push notification
+via FCM (Firebase Cloud Messaging) or APNs (Apple Push Notification Service),
+depending on the device token's platform.
+
+- Requires client apps to register a device token via `POST /users/device-token`.
+- FCM uses the HTTP v1 API with a service account for OAuth2 (see env vars above).
+- APNs uses signed JWT provider tokens (`.p8` key).
+- If no push credentials are configured the backend logs a warning instead of crashing,
+  so push is opt-in.
 
 ### Chats
 - `GET /chats` - List user's chats

@@ -224,39 +224,254 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
             raise HTTPException(status_code=401, detail="User not found")
         return user
 
-# ============== WebSocket Manager ==============
-import threading
+# ============== Push Notifications (FCM / APNs) ==============
+import time
+import httpx
+
+FCM_TOKEN_URL = "https://oauth2.googleapis.com/token"
+FCM_SEND_URL = "https://fcm.googleapis.com/v1/projects/{project_id}/messages:send"
+FCM_SCOPE = "https://www.googleapis.com/auth/firebase.messaging"
+APNS_ENDPOINT = "https://api.push.apple.com/3/device/{device_token}"
+MAX_PUSH_CONTENT_LENGTH = 100
+
+# Cache for the FCM OAuth2 access token (minted from the service account).
+_fcm_token: Optional[str] = None
+_fcm_token_expires_at: float = 0.0
+
+
+def fcm_configured() -> bool:
+    """True when FCM HTTP v1 can be used (project id + service account)."""
+    return bool(
+        os.getenv("FCM_PROJECT_ID", "").strip()
+        and (
+            os.getenv("FCM_SERVICE_ACCOUNT_FILE", "").strip()
+            or os.getenv("FCM_SERVICE_ACCOUNT_JSON", "").strip()
+        )
+    )
+
+
+def apns_configured() -> bool:
+    """True when APNs can be used (team id, key id, bundle id + .p8 key)."""
+    return bool(
+        os.getenv("APNS_TEAM_ID", "").strip()
+        and os.getenv("APNS_KEY_ID", "").strip()
+        and os.getenv("APNS_BUNDLE_ID", "").strip()
+        and os.getenv("APNS_AUTH_KEY_FILE", "").strip()
+    )
+
+
+def _load_service_account() -> Optional[dict]:
+    sa_json = os.getenv("FCM_SERVICE_ACCOUNT_JSON", "").strip()
+    if sa_json:
+        try:
+            return json.loads(sa_json)
+        except (ValueError, TypeError):
+            return None
+    sa_file = os.getenv("FCM_SERVICE_ACCOUNT_FILE", "").strip()
+    if sa_file:
+        try:
+            with open(sa_file, "r") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+async def _get_fcm_access_token() -> Optional[str]:
+    """Return a cached FCM access token, minting a fresh one if needed."""
+    global _fcm_token, _fcm_token_expires_at
+    if _fcm_token and time.time() < _fcm_token_expires_at:
+        return _fcm_token
+
+    sa = _load_service_account()
+    if not sa or not sa.get("client_email") or not sa.get("private_key"):
+        return None
+
+    now = int(time.time())
+    assertion = jwt.encode(
+        {
+            "iss": sa["client_email"],
+            "scope": FCM_SCOPE,
+            "aud": FCM_TOKEN_URL,
+            "iat": now,
+            "exp": now + 3600,
+        },
+        sa["private_key"],
+        algorithm="RS256",
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                FCM_TOKEN_URL,
+                data={"grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer", "assertion": assertion},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        _fcm_token = data.get("access_token")
+        expires_in = int(data.get("expires_in", 3600))
+        _fcm_token_expires_at = time.time() + expires_in - 60
+        return _fcm_token
+    except Exception as e:
+        print(f"FCM access token mint failed: {e}")
+        return None
+
+
+async def _send_fcm_push(device_token: str, title: str, body: str, message_data: dict) -> bool:
+    project_id = os.getenv("FCM_PROJECT_ID", "").strip()
+    if not fcm_configured():
+        print("FCM: not configured (set FCM_PROJECT_ID + service account to enable)")
+        return False
+
+    access_token = await _get_fcm_access_token()
+    if not access_token:
+        print("FCM: no access token available, skipping push")
+        return False
+
+    payload = {
+        "message": {
+            "token": device_token,
+            "notification": {"title": title, "body": body},
+            "data": {
+                "type": message_data.get("type", "message"),
+                "chat_id": str(message_data.get("chat_id", "")),
+                "message_id": str(message_data.get("id", "")),
+                "sender_id": str(message_data.get("sender_id", "")),
+                "sender_name": message_data.get("sender_name", ""),
+                "content": message_data.get("content", ""),
+                "notification_type": message_data.get("type", "message"),
+            },
+            "apns": {"headers": {"apns-priority": "10", "apns-topic": os.getenv("APNS_BUNDLE_ID", "").strip()}},
+        }
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                FCM_SEND_URL.format(project_id=project_id),
+                json=payload,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            resp.raise_for_status()
+        print(f"FCM: push sent to token {device_token[:16]}...")
+        return True
+    except Exception as e:
+        print(f"FCM: push failed for token {device_token[:16]}...: {e}")
+        return False
+
+
+def _make_apns_jwt() -> Optional[str]:
+    team_id = os.getenv("APNS_TEAM_ID", "").strip()
+    key_id = os.getenv("APNS_KEY_ID", "").strip()
+    key_file = os.getenv("APNS_AUTH_KEY_FILE", "").strip()
+    if not (team_id and key_id and key_file):
+        return None
+    try:
+        with open(key_file, "r") as f:
+            auth_key = f.read()
+    except OSError as e:
+        print(f"APNs: failed to read auth key: {e}")
+        return None
+    now = int(time.time())
+    return jwt.encode(
+        {"iss": team_id, "iat": now},
+        auth_key,
+        algorithm="ES256",
+        headers={"kid": key_id},
+    )
+
+
+async def _send_apns_push(device_token: str, title: str, body: str, message_data: dict) -> bool:
+    if not apns_configured():
+        print("APNs: not configured (set APNS_TEAM_ID, APNS_KEY_ID, APNS_BUNDLE_ID, APNS_AUTH_KEY_FILE to enable)")
+        return False
+
+    provider_token = _make_apns_jwt()
+    if not provider_token:
+        print("APNs: could not build provider token, skipping push")
+        return False
+
+    payload = {
+        "aps": {
+            "alert": {"title": title, "body": body},
+            "sound": "default",
+        },
+        "type": message_data.get("type", "message"),
+        "chat_id": message_data.get("chat_id"),
+        "message_id": message_data.get("id"),
+        "sender_id": message_data.get("sender_id"),
+        "sender_name": message_data.get("sender_name", ""),
+        "content": message_data.get("content", ""),
+        "notification_type": message_data.get("type", "message"),
+    }
+
+    headers = {
+        "Authorization": f"bearer {provider_token}",
+        "apns-topic": os.getenv("APNS_BUNDLE_ID", "").strip(),
+        "apns-priority": "10",
+        "apns-push-type": "alert",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # APNs requires HTTP/2; fall back to HTTP/1.1 when h2 is unavailable.
+        for http2 in (True, False):
+            try:
+                async with httpx.AsyncClient(timeout=10.0, http2=http2) as client:
+                    resp = await client.post(
+                        APNS_ENDPOINT.format(device_token=device_token),
+                        json=payload,
+                        headers=headers,
+                    )
+                    resp.raise_for_status()
+                break
+            except ImportError:
+                continue
+        print(f"APNs: push sent to device {device_token[:16]}...")
+        return True
+    except Exception as e:
+        print(f"APNs: push failed for device {device_token[:16]}...: {e}")
+        return False
+
+
+def _truncate_push_content(content: str) -> str:
+    if len(content) > MAX_PUSH_CONTENT_LENGTH:
+        return content[:MAX_PUSH_CONTENT_LENGTH - 3] + "..."
+    return content
+
 
 async def trigger_push_notifications(user_ids: List[int], message_data: dict, sender_name: str):
     """
-    Mock implementation of FCM/APNs push notification trigger.
-    In a real application, this would use a library like firebase-admin or httpx
-    to send the actual push notification to the respective platform.
+    Send push notifications (FCM / APNs) to the given offline users.
+    Skips silently when no platform credentials are configured.
     """
     if not user_ids:
         return
-        
+
     async with async_session() as session:
         from sqlalchemy import select
         result = await session.execute(
             select(DeviceToken).where(DeviceToken.user_id.in_(user_ids))
         )
         tokens = result.scalars().all()
-        
-        for dt in tokens:
-            content = message_data.get("content", "")
-            # Truncate content for push notification
-            if len(content) > 100:
-                content = content[:97] + "..."
-                
-            print(f"PUSH NOTIFICATION [{dt.platform.upper()}]: To User {dt.user_id} (Token: {dt.token}) - {sender_name}: {content}")
-            # Mock HTTP call for APNs/FCM
-            # if dt.platform == 'fcm':
-            #     # HTTP call to FCM endpoint
-            #     pass
-            # elif dt.platform == 'apns':
-            #     # HTTP call to APNs endpoint
-            #     pass
+
+    if not tokens:
+        return
+
+    title = sender_name or "New message"
+    body = _truncate_push_content(message_data.get("content", ""))
+
+    for dt in tokens:
+        try:
+            if dt.platform == "apns":
+                await _send_apns_push(dt.token, title, body, message_data)
+            else:  # default: fcm
+                await _send_fcm_push(dt.token, title, body, message_data)
+        except Exception as e:
+            print(f"push dispatch failed for token {dt.token[:16]}...: {e}")
+
+# ============== WebSocket Manager ==============
+import threading
 
 class ConnectionManager:
     def __init__(self):
@@ -698,6 +913,35 @@ async def register_device_token(
         session.add(new_token)
         await session.commit()
         return {"status": "registered"}
+
+@app.delete("/users/device-token")
+async def unregister_device_token(
+    token: str,
+    current_user: User = Depends(get_current_user)
+):
+    async with async_session() as session:
+        from sqlalchemy import select
+        result = await session.execute(
+            select(DeviceToken).where(
+                DeviceToken.token == token,
+                DeviceToken.user_id == current_user.id
+            )
+        )
+        existing = result.scalar_one_or_none()
+        if existing:
+            await session.delete(existing)
+            await session.commit()
+        return {"status": "unregistered"}
+
+@app.get("/users/device-tokens")
+async def list_device_tokens(current_user: User = Depends(get_current_user)):
+    async with async_session() as session:
+        from sqlalchemy import select
+        result = await session.execute(
+            select(DeviceToken).where(DeviceToken.user_id == current_user.id)
+        )
+        tokens = result.scalars().all()
+        return [{"token": t.token, "platform": t.platform, "created_at": t.created_at} for t in tokens]
 
 # Update user profile
 class ProfileUpdate(BaseModel):
