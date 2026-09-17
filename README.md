@@ -185,8 +185,11 @@ cd android
 | GET | `/auth/me` | Get current user |
 | GET | `/users` | List all users |
 | GET | `/chats` | List user's chats |
-| POST | `/chats` | Create new chat |
+| POST | `/chats` | Create new chat (group members added via invites) |
 | GET | `/chats/{id}/messages` | Get chat messages |
+| GET | `/invites` | List pending chat invites |
+| POST | `/invites/{id}/accept` | Accept a chat invite |
+| POST | `/invites/{id}/reject` | Reject a chat invite |
 | WS | `/ws` | WebSocket connection |
 
 ## 🐳 Docker

@@ -1,12 +1,12 @@
 """
 Chat App Backend - FastAPI with WebSocket Support
 """
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, status, Request, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean, Index
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, Boolean, Index, UniqueConstraint
 from sqlalchemy.sql import func
 from pydantic import BaseModel, field_validator
 from typing import Optional, List, Dict
@@ -17,21 +17,16 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 import json
 import asyncio
 import os
-from enum import Enum
-
-from slowapi import Limiter
-from slowapi.util import get_remote_address
-from slowapi.errors import RateLimitExceeded
-from fastapi.responses import JSONResponse
+import uuid
 
 # ============== Rate Limiter ==============
 limiter = Limiter(key_func=get_remote_address)
 
 # ============== CONFIG ==============
-import os
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./chat.db")
 JWT_SECRET = os.getenv("JWT_SECRET", "chat-app-secret-key-change-in-production")
@@ -84,6 +79,19 @@ class Message(Base):
     
     __table_args__ = (
         Index('idx_message_chat_created', 'chat_id', 'created_at'),
+    )
+
+class ChatInvite(Base):
+    __tablename__ = "chat_invites"
+    id = Column(Integer, primary_key=True, index=True)
+    chat_id = Column(Integer, ForeignKey("chats.id"), index=True)
+    inviter_id = Column(Integer, ForeignKey("users.id"), index=True)
+    invitee_id = Column(Integer, ForeignKey("users.id"), index=True)
+    status = Column(String, default="pending")  # pending, accepted, rejected
+    created_at = Column(DateTime, default=func.now())
+    
+    __table_args__ = (
+        UniqueConstraint('chat_id', 'invitee_id', name='uq_chat_invite_chat_invitee'),
     )
 
 async def init_db():
@@ -164,6 +172,17 @@ class MessageResponse(BaseModel):
     is_read: bool
     created_at: datetime
 
+    class Config:
+        from_attributes = True
+
+class ChatInviteResponse(BaseModel):
+    id: int
+    chat_id: int
+    inviter_id: int
+    invitee_id: int
+    status: str
+    created_at: datetime
+    
     class Config:
         from_attributes = True
 
@@ -319,8 +338,13 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type"],
 )
 
+UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
+
 @app.on_event("startup")
 async def startup():
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
     await init_db()
 
 # ============== Auth Routes ==============
@@ -448,22 +472,57 @@ async def create_chat(chat: ChatCreate, current_user: User = Depends(get_current
     async with async_session() as session:
         from sqlalchemy import select
         
+        # Dedupe member_ids while preserving order, and never invite the creator
+        member_ids = list(dict.fromkeys(chat.member_ids))
+        member_ids = [uid for uid in member_ids if uid != current_user.id]
+        
+        # Validate that every member references an existing user
+        if member_ids:
+            users_result = await session.execute(
+                select(User).where(User.id.in_(member_ids))
+            )
+            existing_ids = {u.id for u in users_result.scalars().all()}
+            missing_ids = [uid for uid in member_ids if uid not in existing_ids]
+            if missing_ids:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unknown user(s): {missing_ids}"
+                )
+        
         # Create chat
         new_chat = Chat(name=chat.name, is_group=chat.is_group)
         session.add(new_chat)
         await session.commit()
         await session.refresh(new_chat)
         
-        # Add members
-        member_ids = chat.member_ids + [current_user.id]
+        # Add the creator as an active member
+        role = "admin" if chat.is_group else "member"
+        creator_member = ChatMember(chat_id=new_chat.id, user_id=current_user.id, role=role)
+        session.add(creator_member)
+        
+        active_member_ids = [current_user.id]
+        all_user_ids = member_ids + [current_user.id]
+        
         for user_id in member_ids:
-            member = ChatMember(chat_id=new_chat.id, user_id=user_id)
-            session.add(member)
+            if chat.is_group:
+                # Group chats require an invite before membership
+                invite = ChatInvite(
+                    chat_id=new_chat.id,
+                    inviter_id=current_user.id,
+                    invitee_id=user_id,
+                    status="pending"
+                )
+                session.add(invite)
+            else:
+                # Direct messages add the other person directly
+                member = ChatMember(chat_id=new_chat.id, user_id=user_id)
+                session.add(member)
+                active_member_ids.append(user_id)
         
         # If group with no name, auto-generate
-        if chat.is_group and not chat.name:
+        if chat.is_group and not chat.name and all_user_ids:
             users_result = await session.execute(
-                select(User).where(User.id.in_(member_ids))
+                select(User).where(User.id.in_(all_user_ids))
             )
             users = users_result.scalars().all()
             names = [u.display_name or u.username for u in users[:3]]
@@ -473,7 +532,7 @@ async def create_chat(chat: ChatCreate, current_user: User = Depends(get_current
         
         # Get members for response
         members_result = await session.execute(
-            select(User).where(User.id.in_(member_ids))
+            select(User).where(User.id.in_(active_member_ids))
         )
         members = members_result.scalars().all()
         
@@ -640,6 +699,81 @@ async def websocket_endpoint(websocket: WebSocket):
         manager.disconnect(user_id)
 
 # ============== Additional Endpoints ==============
+
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+
+# Map of allowed content types to a safe file extension. The client-supplied
+# filename/extension is never used for the stored path to avoid path traversal
+# and stored-XSS (e.g. an .html file served from /uploads).
+CONTENT_TYPE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "application/pdf": ".pdf",
+    "text/plain": ".txt",
+    "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+}
+ALLOWED_IMAGE_TYPES = ["image/jpeg", "image/png", "image/gif", "image/webp"]
+ALLOWED_FILE_TYPES = list(CONTENT_TYPE_EXTENSIONS.keys())
+
+CHUNK_SIZE = 1024 * 1024  # 1MB read chunks
+
+@app.post("/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_user)
+):
+    content_type = (file.content_type or "").split(";")[0].strip().lower()
+
+    # Validate declared type up-front
+    if content_type not in ALLOWED_FILE_TYPES:
+        raise HTTPException(status_code=400, detail="File type not allowed")
+
+    is_image = content_type in ALLOWED_IMAGE_TYPES
+    max_size = MAX_IMAGE_SIZE if is_image else MAX_FILE_SIZE
+
+    # Stream to disk in chunks, aborting if the limit is exceeded so a huge
+    # upload cannot exhaust memory or disk.
+    ext = CONTENT_TYPE_EXTENSIONS[content_type]
+    filename = f"{uuid.uuid4().hex}{ext}"
+    filepath = os.path.join(UPLOAD_DIR, filename)
+
+    size = 0
+    try:
+        with open(filepath, "wb") as f:
+            while True:
+                chunk = await file.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > max_size:
+                    f.close()
+                    os.remove(filepath)
+                    limit_mb = max_size // (1024 * 1024)
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"File exceeds maximum allowed size ({limit_mb}MB)",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        raise
+    except Exception:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+        raise HTTPException(status_code=500, detail="Failed to store uploaded file")
+    finally:
+        await file.close()
+
+    return {
+        "url": f"/uploads/{filename}",
+        "filename": file.filename,
+        "content_type": content_type,
+        "message_type": "image" if is_image else "file",
+        "size": size,
+    }
 
 # Update user profile
 class ProfileUpdate(BaseModel):
@@ -848,6 +982,87 @@ async def search_messages(
             ))
         
         return response
+
+# ============== Invites ==============
+@app.get("/invites", response_model=List[ChatInviteResponse])
+async def get_invites(current_user: User = Depends(get_current_user)):
+    async with async_session() as session:
+        from sqlalchemy import select
+        
+        result = await session.execute(
+            select(ChatInvite).where(
+                ChatInvite.invitee_id == current_user.id,
+                ChatInvite.status == "pending"
+            )
+        )
+        invites = result.scalars().all()
+        return invites
+
+@app.post("/invites/{invite_id}/accept")
+async def accept_invite(invite_id: int, current_user: User = Depends(get_current_user)):
+    async with async_session() as session:
+        from sqlalchemy import select
+        
+        result = await session.execute(
+            select(ChatInvite).where(
+                ChatInvite.id == invite_id,
+                ChatInvite.invitee_id == current_user.id,
+                ChatInvite.status == "pending"
+            )
+        )
+        invite = result.scalar_one_or_none()
+        
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found or already processed")
+        
+        # Verify the chat still exists
+        chat_result = await session.execute(
+            select(Chat).where(Chat.id == invite.chat_id)
+        )
+        if not chat_result.scalar_one_or_none():
+            raise HTTPException(status_code=404, detail="Chat no longer exists")
+        
+        # Avoid duplicate membership (e.g. accepted via another invite)
+        existing_member = await session.execute(
+            select(ChatMember).where(
+                ChatMember.chat_id == invite.chat_id,
+                ChatMember.user_id == current_user.id
+            )
+        )
+        if existing_member.scalar_one_or_none():
+            invite.status = "accepted"
+            await session.commit()
+            return {"status": "accepted"}
+            
+        invite.status = "accepted"
+        
+        # Add to chat members
+        member = ChatMember(chat_id=invite.chat_id, user_id=current_user.id, role="member")
+        session.add(member)
+        
+        await session.commit()
+        return {"status": "accepted"}
+
+@app.post("/invites/{invite_id}/reject")
+async def reject_invite(invite_id: int, current_user: User = Depends(get_current_user)):
+    async with async_session() as session:
+        from sqlalchemy import select
+        
+        result = await session.execute(
+            select(ChatInvite).where(
+                ChatInvite.id == invite_id,
+                ChatInvite.invitee_id == current_user.id,
+                ChatInvite.status == "pending"
+            )
+        )
+        invite = result.scalar_one_or_none()
+        
+        if not invite:
+            raise HTTPException(status_code=404, detail="Invite not found or already processed")
+            
+        invite.status = "rejected"
+        await session.commit()
+        return {"status": "rejected"}
 
 # ============== Health Check ==============
 @app.get("/health")
