@@ -190,7 +190,7 @@ cd android
 | GET | `/invites` | List pending chat invites |
 | POST | `/invites/{id}/accept` | Accept a chat invite |
 | POST | `/invites/{id}/reject` | Reject a chat invite |
-| WS | `/ws/{token}` | WebSocket connection |
+| WS | `/ws` | WebSocket connection |
 
 ## 🐳 Docker
 

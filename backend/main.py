@@ -616,9 +616,15 @@ async def get_messages(request: Request, chat_id: int, limit: int = 50, before: 
         return response
 
 # ============== WebSocket ==============
-@app.websocket("/ws/{token}")
-async def websocket_endpoint(websocket: WebSocket, token: str):
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
     try:
+        auth_header = websocket.headers.get("authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            await websocket.close(code=4001)
+            return
+            
+        token = auth_header.split(" ")[1]
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
         user_id = int(payload.get("sub"))
     except:
